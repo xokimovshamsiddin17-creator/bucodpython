@@ -1,4 +1,4 @@
-# main.py - To'liq Telegram bot (aiogram 3.x)
+# main.py - To'liq Telegram bot (aiogram 3.x) - Python 3.13 uchun optimallashtirilgan
 
 import asyncio
 import logging
@@ -8,7 +8,7 @@ import string
 import re
 import os
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 from dataclasses import dataclass
 from contextlib import contextmanager
 from dotenv import load_dotenv
@@ -33,7 +33,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('bot.log'),
+        logging.FileHandler('bot.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -114,7 +114,7 @@ class Database:
                     username TEXT,
                     first_name TEXT NOT NULL,
                     last_name TEXT,
-                    is_admin BOOLEAN DEFAULT FALSE,
+                    is_admin INTEGER DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -154,7 +154,7 @@ class Database:
                     channel_title TEXT NOT NULL,
                     added_by INTEGER NOT NULL,
                     added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    is_active BOOLEAN DEFAULT TRUE,
+                    is_active INTEGER DEFAULT 1,
                     FOREIGN KEY (added_by) REFERENCES users (telegram_id)
                 )
             ''')
@@ -213,14 +213,14 @@ class Database:
             cursor = conn.cursor()
             cursor.execute('SELECT is_admin FROM users WHERE telegram_id = ?', (telegram_id,))
             row = cursor.fetchone()
-            return row['is_admin'] if row else False
+            return bool(row and row['is_admin'] == 1)
     
     def get_all_users_count(self) -> int:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT COUNT(*) as count FROM users')
             row = cursor.fetchone()
-            return row['count']
+            return row['count'] if row else 0
     
     # File methods
     def create_file(self, code: str, admin_id: int, description: Optional[str] = None) -> int:
@@ -246,7 +246,7 @@ class Database:
     def get_file_by_code(self, code: str) -> Optional[Dict[str, Any]]:
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT * FROM files WHERE code = ?', (code,))
+            cursor.execute('SELECT * FROM files WHERE code = ?', (code.upper(),))
             row = cursor.fetchone()
             return dict(row) if row else None
     
@@ -281,14 +281,14 @@ class Database:
             cursor = conn.cursor()
             cursor.execute('SELECT COUNT(*) as count FROM files')
             row = cursor.fetchone()
-            return row['count']
+            return row['count'] if row else 0
     
     def get_file_items_count(self) -> int:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT COUNT(*) as count FROM file_items')
             row = cursor.fetchone()
-            return row['count']
+            return row['count'] if row else 0
     
     # Channel methods
     def add_channel(self, channel_id: int, channel_title: str, added_by: int, 
@@ -331,7 +331,7 @@ class Database:
                     VALUES (?, ?)
                 ''', (user_id, added_by))
                 conn.commit()
-                return True
+                return cursor.rowcount > 0
             except Exception as e:
                 logger.error(f"Error adding to whitelist: {e}")
                 return False
@@ -354,7 +354,7 @@ class Database:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT w.*, u.username, u.first_name, u.telegram_id
+                SELECT w.*, u.username, u.first_name, u.last_name, u.telegram_id
                 FROM whitelist w
                 JOIN users u ON w.user_id = u.telegram_id
                 ORDER BY w.added_at DESC
@@ -383,7 +383,7 @@ class CodeGenerator:
     
     @staticmethod
     def validate_code(code: str) -> bool:
-        return bool(re.match(r'^[A-Z0-9]{8}$', code))
+        return bool(re.match(r'^[A-Z0-9]{8}$', code.upper()))
 
 class ChannelChecker:
     def __init__(self, bot: Bot):
@@ -462,7 +462,9 @@ def extract_channel_username(text: str) -> Optional[str]:
     
     return None
 
-def format_size(size_bytes: int) -> str:
+def format_size(size_bytes: Optional[int]) -> str:
+    if not size_bytes:
+        return "Noma'lum"
     if size_bytes < 1024:
         return f"{size_bytes} B"
     elif size_bytes < 1024 * 1024:
@@ -523,7 +525,7 @@ def get_back_keyboard(target: str = "main") -> InlineKeyboardMarkup:
 def get_subscription_keyboard(channels: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
     buttons = []
     for channel in channels:
-        if channel['channel_username']:
+        if channel.get('channel_username'):
             url = f"https://t.me/{channel['channel_username']}"
         else:
             url = f"https://t.me/c/{str(channel['channel_id'])[4:]}"
@@ -576,7 +578,7 @@ def get_channels_keyboard(channels: List[Dict[str, Any]], action: str = "remove"
 def get_whitelist_keyboard(whitelist: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
     buttons = []
     for item in whitelist:
-        username = item['username'] or item['first_name']
+        username = item.get('username') or item.get('first_name', 'Unknown')
         if len(username) > 20:
             username = username[:17] + "..."
         
@@ -603,11 +605,15 @@ class SubscriptionMiddleware(BaseMiddleware):
         self.channel_checker = channel_checker
         super().__init__()
     
-    async def __call__(self, handler, event, data):
+    async def __call__(self, handler, event: Union[Message, CallbackQuery], data: Dict[str, Any]):
         user_id = event.from_user.id
         
         # Skip check for admins
         if self.db.is_admin(user_id) or self.db.is_whitelisted(user_id):
+            return await handler(event, data)
+        
+        # Skip for callback queries that are checking subscription
+        if isinstance(event, CallbackQuery) and event.data == "check_subscription":
             return await handler(event, data)
         
         # Check if it's a code message
@@ -811,7 +817,7 @@ class BotHandlers:
             for item in file_items:
                 try:
                     caption = f"📁 {item['file_name'] or 'Fayl'}"
-                    if item['file_size']:
+                    if item.get('file_size'):
                         caption += f" | {format_size(item['file_size'])}"
                     
                     if item['file_type'] == 'photo':
@@ -974,7 +980,7 @@ class BotHandlers:
                 files.append(file_data)
                 await state.update_data(files=files)
                 
-                size_info = f" | {format_size(file_data['size'])}" if file_data['size'] else ""
+                size_info = f" | {format_size(file_data['size'])}" if file_data.get('size') else ""
                 await message.answer(
                     f"✅ *Fayl qabul qilindi*\n\n"
                     f"📁 {file_data['name']}{size_info}\n"
@@ -1037,7 +1043,7 @@ class BotHandlers:
             for item in file_items:
                 try:
                     caption = f"📁 {item['file_name'] or 'Fayl'}"
-                    if item['file_size']:
+                    if item.get('file_size'):
                         caption += f" | {format_size(item['file_size'])}"
                     
                     if item['file_type'] == 'photo':
@@ -1238,9 +1244,10 @@ class BotHandlers:
                 return
             
             if self.db.add_to_whitelist(user_id, message.from_user.id):
+                username_display = user.get('username', str(user_id))
                 await message.answer(
                     f"✅ *Foydalanuvchi whitelistga qo'shildi!*\n\n"
-                    f"👤 *Foydalanuvchi:* @{user['username'] or user_id}\n"
+                    f"👤 *Foydalanuvchi:* @{username_display}\n"
                     f"⚠️ Bu foydalanuvchi endi kanal majburiyatidan ozod qilindi.",
                     parse_mode="Markdown"
                 )
@@ -1283,7 +1290,7 @@ class BotHandlers:
             
             if self.db.remove_from_whitelist(user_id):
                 user = self.db.get_user(user_id)
-                username = user['username'] if user else str(user_id)
+                username = user.get('username', str(user_id)) if user else str(user_id)
                 
                 await callback.message.edit_text(
                     f"✅ *Foydalanuvchi whitelistdan o'chirildi!*\n\n"
